@@ -5,7 +5,7 @@ template<int WARP_SZ>
 __device__ inline float warp_cumsum(float val, int lane_id) {
 #pragma unroll
     for (int offset = 1; offset < WARP_SZ; offset *= 2) {
-        float n = __shfl_up_sync(0xffffffff, val, offset);
+        float n = __shfl_up_sync(0xffffffff, val, offset, WARP_SZ);
         if (lane_id >= offset) val += n;
     }
     return val;
