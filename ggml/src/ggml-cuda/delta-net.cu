@@ -2,8 +2,9 @@
 
 // Recurrent delta network kernel
 // Processes sequences with recurrent state updates (similar to cumsum but with state)
-template<bool chunked>
-__global__ void delta_net_recurrent_kernel(
+// Optimized with parallel scan for better performance
+template<int BLOCK_SIZE>
+__global__ void delta_net_parallel_kernel(
     const float * __restrict__ x,
     float * __restrict__ dst,
     int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
@@ -19,24 +20,84 @@ __global__ void delta_net_recurrent_kernel(
     const float * src_row = (const float *)((const char *)x + i1*nb1 + i2*nb2 + i3*nb3);
     float * dst_row = (float *)((char *)dst + i1*dst_nb1 + i2*dst_nb2 + i3*dst_nb3);
 
-    float s = 0.0f; // Initial state
+    const int tid = threadIdx.x;
+    const int lane_id = tid & 31;
+    const int warp_id = tid / 32;
+    const int num_warps = BLOCK_SIZE / 32;
 
-    if (chunked) {
-        // Chunked processing: process in chunks for better memory access
-        const int chunk_size = 32;
-        for (int64_t t = 0; t < ne0; t += chunk_size) {
-            int64_t chunk_end = min(t + chunk_size, ne0);
-            for (int64_t i = t; i < chunk_end; i++) {
-                s = s + src_row[i]; // Delta update: state = state + delta
-                dst_row[i] = s;
+    __shared__ float warp_sums[32]; // max 32 warps per block
+
+    float carry_accum = 0.0f;
+
+    // Use parallel scan similar to cumsum
+    for (int64_t i = tid; i < ne0; i += BLOCK_SIZE) {
+        float val = __ldg(&src_row[i]);
+        
+        // Warp-level inclusive scan
+        #pragma unroll
+        for (int offset = 1; offset < 32; offset *= 2) {
+            float n = __shfl_up_sync(0xffffffff, val, offset, 32);
+            if (lane_id >= offset) val += n;
+        }
+
+        // Store warp-level sum
+        if (lane_id == 31) {
+            warp_sums[warp_id] = val;
+        }
+        __syncthreads();
+
+        // First warp computes prefix sum of warp sums
+        if (warp_id == 0) {
+            float warp_sum = (lane_id < num_warps) ? warp_sums[lane_id] : 0.0f;
+            #pragma unroll
+            for (int offset = 1; offset < 32; offset *= 2) {
+                float n = __shfl_up_sync(0xffffffff, warp_sum, offset, 32);
+                if (lane_id >= offset) warp_sum += n;
+            }
+            if (lane_id < num_warps) {
+                warp_sums[lane_id] = warp_sum;
             }
         }
-    } else {
-        // Sequential processing
-        for (int64_t i = 0; i < ne0; i++) {
-            s = s + src_row[i]; // Delta update: state = state + delta
-            dst_row[i] = s;
+        __syncthreads();
+
+        // Add prefix sum of previous warps to current value
+        if (warp_id > 0) {
+            val += warp_sums[warp_id - 1];
         }
+        val += carry_accum;
+
+        dst_row[i] = val;
+
+        // Update carry for next chunk
+        if (tid == BLOCK_SIZE - 1) {
+            carry_accum = val;
+        }
+        __syncthreads();
+    }
+}
+
+// Sequential kernel for very large sequences
+__global__ void delta_net_sequential_kernel(
+    const float * __restrict__ x,
+    float * __restrict__ dst,
+    int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+    int64_t nb0, int64_t nb1, int64_t nb2, int64_t nb3,
+    int64_t dst_nb0, int64_t dst_nb1, int64_t dst_nb2, int64_t dst_nb3) {
+
+    const int64_t i3 = blockIdx.z;
+    const int64_t i2 = blockIdx.y;
+    const int64_t i1 = blockIdx.x;
+
+    if (i3 >= ne3 || i2 >= ne2 || i1 >= ne1) return;
+    if (threadIdx.x != 0) return;
+
+    const float * src_row = (const float *)((const char *)x + i1*nb1 + i2*nb2 + i3*nb3);
+    float * dst_row = (float *)((char *)dst + i1*dst_nb1 + i2*dst_nb2 + i3*dst_nb3);
+
+    float s = 0.0f;
+    for (int64_t i = 0; i < ne0; i++) {
+        s = s + __ldg(&src_row[i]);
+        dst_row[i] = s;
     }
 }
 
@@ -70,18 +131,17 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     // Launch kernel
     dim3 grid(ne1, ne2, ne3);
 
-    if (ne0 <= 1024) {
-        // Use recurrent kernel for short sequences
-        const int block_size = 1; // One thread per row
-        delta_net_recurrent_kernel<false><<<grid, block_size, 0, stream>>>(
+    if (ne0 <= 4096) {
+        // Use parallel scan for small to medium sequences
+        const int block_size = 512;
+        delta_net_parallel_kernel<block_size><<<grid, block_size, 0, stream>>>(
             src0_d, dst_d, ne0, ne1, ne2, ne3,
             nb0, nb1, nb2, nb3,
             dst_nb0, dst_nb1, dst_nb2, dst_nb3
         );
     } else {
-        // Use sequential kernel for very long sequences (similar to cumsum)
-        const int block_size = 1;
-        delta_net_recurrent_kernel<false><<<grid, block_size, 0, stream>>>(
+        // Use sequential kernel for very long sequences
+        delta_net_sequential_kernel<<<grid, 1, 0, stream>>>(
             src0_d, dst_d, ne0, ne1, ne2, ne3,
             nb0, nb1, nb2, nb3,
             dst_nb0, dst_nb1, dst_nb2, dst_nb3
