@@ -21,9 +21,15 @@ __global__ void delta_net_parallel_kernel(
     float * dst_row = (float *)((char *)dst + i1*dst_nb1 + i2*dst_nb2 + i3*dst_nb3);
 
     const int tid = threadIdx.x;
-    const int lane_id = tid & 31;
-    const int warp_id = tid / 32;
-    const int num_warps = BLOCK_SIZE / 32;
+    // Get actual warp size (32 for CUDA, 64 for AMD GFX8/GFX9)
+#if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
+    const int warp_size = 64;
+#else
+    const int warp_size = 32;
+#endif
+    const int lane_id = tid & (warp_size - 1);
+    const int warp_id = tid / warp_size;
+    const int num_warps = BLOCK_SIZE / warp_size;
 
     __shared__ float warp_sums[32]; // max 32 warps per block
 
@@ -31,17 +37,17 @@ __global__ void delta_net_parallel_kernel(
 
     // Use parallel scan similar to cumsum
     for (int64_t i = tid; i < ne0; i += BLOCK_SIZE) {
-        float val = __ldg(&src_row[i]);
+        float val = GGML_CUDA_LDG(&src_row[i]);
         
         // Warp-level inclusive scan
         #pragma unroll
-        for (int offset = 1; offset < 32; offset *= 2) {
-            float n = __shfl_up_sync(0xffffffff, val, offset, 32);
+        for (int offset = 1; offset < warp_size; offset *= 2) {
+            float n = __shfl_up_sync(0xffffffff, val, offset, warp_size);
             if (lane_id >= offset) val += n;
         }
 
         // Store warp-level sum
-        if (lane_id == 31) {
+        if (lane_id == warp_size - 1) {
             warp_sums[warp_id] = val;
         }
         __syncthreads();
@@ -50,8 +56,8 @@ __global__ void delta_net_parallel_kernel(
         if (warp_id == 0) {
             float warp_sum = (lane_id < num_warps) ? warp_sums[lane_id] : 0.0f;
             #pragma unroll
-            for (int offset = 1; offset < 32; offset *= 2) {
-                float n = __shfl_up_sync(0xffffffff, warp_sum, offset, 32);
+            for (int offset = 1; offset < warp_size; offset *= 2) {
+                float n = __shfl_up_sync(0xffffffff, warp_sum, offset, warp_size);
                 if (lane_id >= offset) warp_sum += n;
             }
             if (lane_id < num_warps) {
@@ -96,7 +102,7 @@ __global__ void delta_net_sequential_kernel(
 
     float s = 0.0f;
     for (int64_t i = 0; i < ne0; i++) {
-        s = s + __ldg(&src_row[i]);
+        s = s + GGML_CUDA_LDG(&src_row[i]);
         dst_row[i] = s;
     }
 }

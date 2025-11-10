@@ -245,6 +245,15 @@ static const char * cu_get_error_str(CUresult err) {
 #define FLASH_ATTN_AVAILABLE
 #endif // !defined(GGML_CUDA_NO_FA) && !(defined(GGML_USE_MUSA) && __MUSA_ARCH__ < 220)
 
+// HIP compatibility: __ldg() may not be available or behave differently
+#if defined(GGML_USE_HIP)
+// On HIP, use regular load (HIP compiler may optimize automatically)
+#define GGML_CUDA_LDG(x) (*(x))
+#else
+// On CUDA, use __ldg() for read-only data (texture cache)
+#define GGML_CUDA_LDG(x) __ldg(x)
+#endif // defined(GGML_USE_HIP)
+
 static bool fp16_available(const int cc) {
     return ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_PASCAL;
 }

@@ -50,10 +50,10 @@ __global__ void tri_f32_kernel(const float * __restrict__ x, float * __restrict_
             float4 src_vec = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             float4 dst_vec;
             
-            if (i < ne0) src_vec.x = __ldg(&src_row[i]);
-            if (i + 1 < ne0) src_vec.y = __ldg(&src_row[i + 1]);
-            if (i + 2 < ne0) src_vec.z = __ldg(&src_row[i + 2]);
-            if (i + 3 < ne0) src_vec.w = __ldg(&src_row[i + 3]);
+            if (i < ne0) src_vec.x = GGML_CUDA_LDG(&src_row[i]);
+            if (i + 1 < ne0) src_vec.y = GGML_CUDA_LDG(&src_row[i + 1]);
+            if (i + 2 < ne0) src_vec.z = GGML_CUDA_LDG(&src_row[i + 2]);
+            if (i + 3 < ne0) src_vec.w = GGML_CUDA_LDG(&src_row[i + 3]);
             
             dst_vec.x = (i >= start_idx && i < end_idx) ? (keep_org_val ? src_vec.x : constant) : 0.0f;
             dst_vec.y = (i + 1 >= start_idx && i + 1 < end_idx) ? (keep_org_val ? src_vec.y : constant) : 0.0f;
@@ -68,7 +68,7 @@ __global__ void tri_f32_kernel(const float * __restrict__ x, float * __restrict_
     } else {
         // Scalar path: each thread processes multiple elements
         for (int64_t i = tid; i < ne0; i += block_size) {
-            float val = __ldg(&src_row[i]);
+            float val = GGML_CUDA_LDG(&src_row[i]);
             dst_row[i] = (i >= start_idx && i < end_idx) ? (keep_org_val ? val : constant) : 0.0f;
         }
     }

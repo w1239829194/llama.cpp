@@ -1,5 +1,14 @@
 #include "cumsum.cuh"
 
+// Get actual warp size (32 for CUDA, 64 for AMD GFX8/GFX9)
+static __device__ __forceinline__ int get_warp_size() {
+#if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
+    return 64;
+#else
+    return 32;
+#endif
+}
+
 // Warp-level inclusive scan (cumulative sum)
 template<int WARP_SZ>
 __device__ inline float warp_cumsum(float val, int lane_id) {
@@ -29,11 +38,12 @@ __global__ void cumsum_f32_kernel(const float * __restrict__ x, float * __restri
     float * dst_row = (float *)((char *)dst + i1*dst_nb1 + i2*dst_nb2 + i3*dst_nb3);
 
     const int tid = threadIdx.x;
-    const int lane_id = tid & 31;
-    const int warp_id = tid / 32;
-    const int num_warps = BLOCK_SIZE / 32;
+    const int warp_size = get_warp_size();
+    const int lane_id = tid & (warp_size - 1);
+    const int warp_id = tid / warp_size;
+    const int num_warps = BLOCK_SIZE / warp_size;
 
-    __shared__ float warp_sums[32]; // max 32 warps per block
+    __shared__ float warp_sums[32]; // max 32 warps per block (supports up to 1024 threads)
 
     // Use register for carry instead of shared memory - faster!
     float carry_accum = 0.0f;
@@ -41,12 +51,18 @@ __global__ void cumsum_f32_kernel(const float * __restrict__ x, float * __restri
     // Process elements in chunks of BLOCK_SIZE
     // Optimized: reduce sync overhead by batching operations
     for (int64_t i = tid; i < ne0; i += BLOCK_SIZE) {
-        // Use __ldg for read-only data (texture cache)
-        float val = __ldg(&src_row[i]);
+        // Use GGML_CUDA_LDG for read-only data (texture cache on CUDA, regular load on HIP)
+        float val = GGML_CUDA_LDG(&src_row[i]);
+        
+        // Use appropriate warp size (compile-time optimization)
+#if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
+        val = warp_cumsum<64>(val, lane_id);
+#else
         val = warp_cumsum<32>(val, lane_id);
+#endif
 
         // Store warp-level sum for later
-        if (lane_id == 31) {
+        if (lane_id == warp_size - 1) {
             warp_sums[warp_id] = val;
         }
         __syncthreads();
@@ -54,7 +70,11 @@ __global__ void cumsum_f32_kernel(const float * __restrict__ x, float * __restri
         // First warp computes prefix sum of warp sums
         if (warp_id == 0) {
             float warp_sum = (lane_id < num_warps) ? warp_sums[lane_id] : 0.0f;
+#if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
+            warp_sum = warp_cumsum<64>(warp_sum, lane_id);
+#else
             warp_sum = warp_cumsum<32>(warp_sum, lane_id);
+#endif
             if (lane_id < num_warps) {
                 warp_sums[lane_id] = warp_sum;
             }
