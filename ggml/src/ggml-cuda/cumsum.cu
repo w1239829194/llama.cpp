@@ -1,9 +1,10 @@
 #include "cumsum.cuh"
 
-// Get actual warp size (32 for CUDA, 64 for AMD GFX8/GFX9)
+// Get actual warp size at runtime
+// RDNA (including RDNA 3.5) uses 32, GCN/CDNA uses 64
 static __device__ __forceinline__ int get_warp_size() {
-#if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
-    return 64;
+#if defined(GGML_USE_HIP)
+    return __builtin_amdgcn_wavefrontsize();
 #else
     return 32;
 #endif
@@ -50,7 +51,9 @@ __global__ void cumsum_f32_kernel(const float * __restrict__ x, float * __restri
     const int warp_id = tid / warp_size;
     const int num_warps = BLOCK_SIZE / warp_size;
 
-    __shared__ float warp_sums[32]; // max 32 warps per block (supports up to 1024 threads)
+    // Optimize shared memory: only allocate what we need
+    // Max warps = BLOCK_SIZE / min_warp_size = 512 / 32 = 16
+    __shared__ float warp_sums[16]; // sufficient for up to 512 threads
 
     // Use register for carry instead of shared memory - faster!
     float carry_accum = 0.0f;
@@ -61,12 +64,12 @@ __global__ void cumsum_f32_kernel(const float * __restrict__ x, float * __restri
         // Use GGML_CUDA_LDG for read-only data (texture cache on CUDA, regular load on HIP)
         float val = GGML_CUDA_LDG(&src_row[i]);
         
-        // Use appropriate warp size (compile-time optimization)
-#if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
-        val = warp_cumsum<64>(val, lane_id);
-#else
-        val = warp_cumsum<32>(val, lane_id);
-#endif
+        // Use runtime warp size for better portability
+        if (warp_size == 64) {
+            val = warp_cumsum<64>(val, lane_id);
+        } else {
+            val = warp_cumsum<32>(val, lane_id);
+        }
 
         // Store warp-level sum for later
         if (lane_id == warp_size - 1) {
@@ -77,11 +80,11 @@ __global__ void cumsum_f32_kernel(const float * __restrict__ x, float * __restri
         // First warp computes prefix sum of warp sums
         if (warp_id == 0) {
             float warp_sum = (lane_id < num_warps) ? warp_sums[lane_id] : 0.0f;
-#if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
-            warp_sum = warp_cumsum<64>(warp_sum, lane_id);
-#else
-            warp_sum = warp_cumsum<32>(warp_sum, lane_id);
-#endif
+            if (warp_size == 64) {
+                warp_sum = warp_cumsum<64>(warp_sum, lane_id);
+            } else {
+                warp_sum = warp_cumsum<32>(warp_sum, lane_id);
+            }
             if (lane_id < num_warps) {
                 warp_sums[lane_id] = warp_sum;
             }
@@ -160,14 +163,19 @@ void ggml_cuda_op_cumsum(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (ne0 <= 4096) {
         // Use parallel scan for small to medium rows
         const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
 
         int block_size = 512;
         if (ne0 <= 256) {
             block_size = 128;
-#if defined(GGML_USE_HIP)
-        } else if (warp_size == 64 && ne0 >= 2048) {
+        } else if (ne0 <= 512) {
             block_size = 256;
-#endif
+        } else if (GGML_CUDA_CC_IS_RDNA35(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            // RDNA 3.5/4: prefer 256 threads for better occupancy
+            block_size = 256;
+        } else if (warp_size == 64 && ne0 >= 2048) {
+            // GCN/CDNA: use 256 for large sequences
+            block_size = 256;
         }
 
         switch (block_size) {

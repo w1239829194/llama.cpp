@@ -33,16 +33,18 @@ __global__ void solve_tri_f32_kernel(
         const char * b_row = b_batch + row * nb1_b;
         char * dst_row = dst_batch + row * nb1_dst;
 
-        const float rhs = *reinterpret_cast<const float *>(b_row + col * nb0_b);
+        // Use GGML_CUDA_LDG for read-only data
+        const float rhs = GGML_CUDA_LDG(reinterpret_cast<const float *>(b_row + col * nb0_b));
 
         float accum = 0.0f;
+        // Optimize: reduce memory accesses by caching frequently accessed values
         for (int64_t t = 0; t < row; ++t) {
-            const float a_val = *reinterpret_cast<const float *>(a_row + t * nb0_a);
-            const float x_val = *reinterpret_cast<const float *>(dst_batch + t * nb1_dst + col * nb0_dst);
+            const float a_val = GGML_CUDA_LDG(reinterpret_cast<const float *>(a_row + t * nb0_a));
+            const float x_val = GGML_CUDA_LDG(reinterpret_cast<const float *>(dst_batch + t * nb1_dst + col * nb0_dst));
             accum += a_val * x_val;
         }
 
-        float diag = *reinterpret_cast<const float *>(a_row + row * nb0_a);
+        float diag = GGML_CUDA_LDG(reinterpret_cast<const float *>(a_row + row * nb0_a));
         if (fabsf(diag) < eps) {
             diag = (diag >= 0.0f ? eps : -eps);
         }
@@ -91,6 +93,8 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int64_t nb3_dst = dst->nb[3];
 
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    
     int block_cols = 256;
     if (ne1 <= warp_size) {
         block_cols = warp_size;
@@ -99,11 +103,18 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     } else if (ne1 <= 256) {
         block_cols = 256;
     } else {
-        block_cols = 256;
+        // For RDNA 3.5/4, use 256 for better occupancy
+        if (GGML_CUDA_CC_IS_RDNA35(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            block_cols = 256;
+        } else {
+            block_cols = 256;
+        }
     }
 
     block_cols = std::max(block_cols, warp_size);
-    block_cols = std::min(block_cols, 256);
+    // RDNA 3.5 can handle up to 512 threads efficiently
+    const int max_block_size = (GGML_CUDA_CC_IS_RDNA35(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) ? 512 : 256;
+    block_cols = std::min(block_cols, max_block_size);
 
     const int grid_x = static_cast<int>((ne1 + block_cols - 1) / block_cols);
     dim3 grid(grid_x, ne2, ne3);
