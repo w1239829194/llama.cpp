@@ -38,9 +38,9 @@ __global__ void delta_net_parallel_kernel(
     const int warp_id = tid / warp_size;
     const int num_warps = BLOCK_SIZE / warp_size;
 
-    // Optimize shared memory: only allocate what we need
-    // Max warps = BLOCK_SIZE / min_warp_size = 512 / 32 = 16
-    __shared__ float warp_sums[16]; // sufficient for up to 512 threads
+    // Shared memory for warp-level sums
+    // Use 32 to ensure proper alignment and avoid bank conflicts
+    __shared__ float warp_sums[32];
 
     float carry_accum = 0.0f;
 
@@ -51,19 +51,10 @@ __global__ void delta_net_parallel_kernel(
         float val = GGML_CUDA_LDG(&src_row[i]);
         
         // Warp-level inclusive scan
-        // Optimize for common warp sizes (32 for RDNA, 64 for GCN/CDNA)
-        if (warp_size == 32) {
-            #pragma unroll
-            for (int offset = 1; offset < 32; offset *= 2) {
-                float n = __shfl_up_sync(full_mask, val, offset, 32);
-                if (lane_id >= offset) val += n;
-            }
-        } else {
-            #pragma unroll
-            for (int offset = 1; offset < warp_size; offset *= 2) {
-                float n = __shfl_up_sync(full_mask, val, offset, warp_size);
-                if (lane_id >= offset) val += n;
-            }
+        #pragma unroll
+        for (int offset = 1; offset < warp_size; offset *= 2) {
+            float n = __shfl_up_sync(full_mask, val, offset, warp_size);
+            if (lane_id >= offset) val += n;
         }
 
         // Store warp-level sum
@@ -75,19 +66,10 @@ __global__ void delta_net_parallel_kernel(
         // First warp computes prefix sum of warp sums
         if (warp_id == 0) {
             float warp_sum = (lane_id < num_warps) ? warp_sums[lane_id] : 0.0f;
-            // Optimize for common warp sizes
-            if (warp_size == 32) {
-                #pragma unroll
-                for (int offset = 1; offset < 32; offset *= 2) {
-                    float n = __shfl_up_sync(full_mask, warp_sum, offset, 32);
-                    if (lane_id >= offset) warp_sum += n;
-                }
-            } else {
-                #pragma unroll
-                for (int offset = 1; offset < warp_size; offset *= 2) {
-                    float n = __shfl_up_sync(full_mask, warp_sum, offset, warp_size);
-                    if (lane_id >= offset) warp_sum += n;
-                }
+            #pragma unroll
+            for (int offset = 1; offset < warp_size; offset *= 2) {
+                float n = __shfl_up_sync(full_mask, warp_sum, offset, warp_size);
+                if (lane_id >= offset) warp_sum += n;
             }
             if (lane_id < num_warps) {
                 warp_sums[lane_id] = warp_sum;
@@ -175,9 +157,6 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         if (ne0 <= 256) {
             block_size = 128;
         } else if (ne0 <= 512) {
-            block_size = 256;
-        } else if (GGML_CUDA_CC_IS_RDNA35(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-            // RDNA 3.5/4: prefer 256 threads for better occupancy
             block_size = 256;
         } else if (warp_size == 64 && ne0 >= 2048) {
             // GCN/CDNA: use 256 for large sequences

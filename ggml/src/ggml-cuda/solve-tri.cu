@@ -93,7 +93,6 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int64_t nb3_dst = dst->nb[3];
 
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
     
     int block_cols = 256;
     if (ne1 <= warp_size) {
@@ -102,19 +101,9 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         block_cols = 128;
     } else if (ne1 <= 256) {
         block_cols = 256;
-    } else {
-        // For RDNA 3.5/4, use 256 for better occupancy
-        if (GGML_CUDA_CC_IS_RDNA35(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-            block_cols = 256;
-        } else {
-            block_cols = 256;
-        }
     }
-
+    
     block_cols = std::max(block_cols, warp_size);
-    // RDNA 3.5 can handle up to 512 threads efficiently
-    const int max_block_size = (GGML_CUDA_CC_IS_RDNA35(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) ? 512 : 256;
-    block_cols = std::min(block_cols, max_block_size);
 
     const int grid_x = static_cast<int>((ne1 + block_cols - 1) / block_cols);
     dim3 grid(grid_x, ne2, ne3);
