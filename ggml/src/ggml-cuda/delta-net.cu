@@ -1,5 +1,11 @@
 #include "delta-net.cuh"
 
+#if defined(GGML_USE_HIP)
+using ggml_cuda_warp_mask_t = unsigned long long;
+#else
+using ggml_cuda_warp_mask_t = unsigned int;
+#endif
+
 // Recurrent delta network kernel
 // Processes sequences with recurrent state updates (similar to cumsum but with state)
 // Optimized with parallel scan for better performance
@@ -35,6 +41,8 @@ __global__ void delta_net_parallel_kernel(
 
     float carry_accum = 0.0f;
 
+    const ggml_cuda_warp_mask_t full_mask = ~ggml_cuda_warp_mask_t(0);
+
     // Use parallel scan similar to cumsum
     for (int64_t i = tid; i < ne0; i += BLOCK_SIZE) {
         float val = GGML_CUDA_LDG(&src_row[i]);
@@ -42,7 +50,7 @@ __global__ void delta_net_parallel_kernel(
         // Warp-level inclusive scan
         #pragma unroll
         for (int offset = 1; offset < warp_size; offset *= 2) {
-            float n = __shfl_up_sync(0xffffffff, val, offset, warp_size);
+            float n = __shfl_up_sync(full_mask, val, offset, warp_size);
             if (lane_id >= offset) val += n;
         }
 
@@ -57,7 +65,7 @@ __global__ void delta_net_parallel_kernel(
             float warp_sum = (lane_id < num_warps) ? warp_sums[lane_id] : 0.0f;
             #pragma unroll
             for (int offset = 1; offset < warp_size; offset *= 2) {
-                float n = __shfl_up_sync(0xffffffff, warp_sum, offset, warp_size);
+                float n = __shfl_up_sync(full_mask, warp_sum, offset, warp_size);
                 if (lane_id >= offset) warp_sum += n;
             }
             if (lane_id < num_warps) {
@@ -139,12 +147,40 @@ void ggml_cuda_op_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     if (ne0 <= 4096) {
         // Use parallel scan for small to medium sequences
-        const int block_size = 512;
-        delta_net_parallel_kernel<block_size><<<grid, block_size, 0, stream>>>(
-            src0_d, dst_d, ne0, ne1, ne2, ne3,
-            nb0, nb1, nb2, nb3,
-            dst_nb0, dst_nb1, dst_nb2, dst_nb3
-        );
+        const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+        int block_size = 512;
+        if (ne0 <= 256) {
+            block_size = 128;
+#if defined(GGML_USE_HIP)
+        } else if (warp_size == 64 && ne0 >= 2048) {
+            block_size = 256;
+#endif
+        }
+
+        switch (block_size) {
+            case 128:
+                delta_net_parallel_kernel<128><<<grid, 128, 0, stream>>>(
+                    src0_d, dst_d, ne0, ne1, ne2, ne3,
+                    nb0, nb1, nb2, nb3,
+                    dst_nb0, dst_nb1, dst_nb2, dst_nb3
+                );
+                break;
+            case 256:
+                delta_net_parallel_kernel<256><<<grid, 256, 0, stream>>>(
+                    src0_d, dst_d, ne0, ne1, ne2, ne3,
+                    nb0, nb1, nb2, nb3,
+                    dst_nb0, dst_nb1, dst_nb2, dst_nb3
+                );
+                break;
+            default:
+                delta_net_parallel_kernel<512><<<grid, 512, 0, stream>>>(
+                    src0_d, dst_d, ne0, ne1, ne2, ne3,
+                    nb0, nb1, nb2, nb3,
+                    dst_nb0, dst_nb1, dst_nb2, dst_nb3
+                );
+                break;
+        }
     } else {
         // Use sequential kernel for very long sequences
         delta_net_sequential_kernel<<<grid, 1, 0, stream>>>(

@@ -57,6 +57,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/delta-net.cuh"
 #include "ggml-cuda/tri.cuh"
+#include "ggml-cuda/solve-tri.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2697,6 +2698,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_TRI:
             ggml_cuda_op_tri(ctx, dst);
+            break;
+        case GGML_OP_SOLVE_TRI:
+            ggml_cuda_op_solve_tri(ctx, dst);
             break;
         default:
             return false;

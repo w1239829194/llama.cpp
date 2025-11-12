@@ -10,11 +10,18 @@ static __device__ __forceinline__ int get_warp_size() {
 }
 
 // Warp-level inclusive scan (cumulative sum)
+#if defined(GGML_USE_HIP)
+using ggml_cuda_warp_mask_t = unsigned long long;
+#else
+using ggml_cuda_warp_mask_t = unsigned int;
+#endif
+
 template<int WARP_SZ>
 __device__ inline float warp_cumsum(float val, int lane_id) {
+    const ggml_cuda_warp_mask_t full_mask = ~ggml_cuda_warp_mask_t(0);
 #pragma unroll
     for (int offset = 1; offset < WARP_SZ; offset *= 2) {
-        float n = __shfl_up_sync(0xffffffff, val, offset, WARP_SZ);
+        float n = __shfl_up_sync(full_mask, val, offset, WARP_SZ);
         if (lane_id >= offset) val += n;
     }
     return val;
@@ -152,13 +159,40 @@ void ggml_cuda_op_cumsum(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     if (ne0 <= 4096) {
         // Use parallel scan for small to medium rows
-        // Use larger block size (512) for better occupancy
-        const int block_size = 512;
-        cumsum_f32_kernel<block_size><<<grid, block_size, 0, stream>>>(
-            src0_d, dst_d, ne0, ne1, ne2, ne3,
-            nb0, nb1, nb2, nb3,
-            dst_nb0, dst_nb1, dst_nb2, dst_nb3
-        );
+        const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+        int block_size = 512;
+        if (ne0 <= 256) {
+            block_size = 128;
+#if defined(GGML_USE_HIP)
+        } else if (warp_size == 64 && ne0 >= 2048) {
+            block_size = 256;
+#endif
+        }
+
+        switch (block_size) {
+            case 128:
+                cumsum_f32_kernel<128><<<grid, 128, 0, stream>>>(
+                    src0_d, dst_d, ne0, ne1, ne2, ne3,
+                    nb0, nb1, nb2, nb3,
+                    dst_nb0, dst_nb1, dst_nb2, dst_nb3
+                );
+                break;
+            case 256:
+                cumsum_f32_kernel<256><<<grid, 256, 0, stream>>>(
+                    src0_d, dst_d, ne0, ne1, ne2, ne3,
+                    nb0, nb1, nb2, nb3,
+                    dst_nb0, dst_nb1, dst_nb2, dst_nb3
+                );
+                break;
+            default:
+                cumsum_f32_kernel<512><<<grid, 512, 0, stream>>>(
+                    src0_d, dst_d, ne0, ne1, ne2, ne3,
+                    nb0, nb1, nb2, nb3,
+                    dst_nb0, dst_nb1, dst_nb2, dst_nb3
+                );
+                break;
+        }
     } else {
         // Use sequential kernel for very large rows
         cumsum_f32_sequential_kernel<<<grid, 1, 0, stream>>>(
